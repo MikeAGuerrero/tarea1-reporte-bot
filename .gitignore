@@ -1,0 +1,21 @@
+# Entorno virtual y cachés de Python
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+
+# Datos: nunca deben subirse al repositorio
+data/input/*
+!data/input/.gitkeep
+data/output/*
+!data/output/.gitkeep
+*.log
+*.csv
+
+# Notebooks temporales
+notebooks/.ipynb_checkpoints/
+
+# Variables locales / sistema
+.env
+.DS_Store

@@ -1,0 +1,29 @@
+[project]
+name = "tarea1-reporte-bot"
+version = "0.1.0"
+description = "Pipeline idempotente para generar tabla_reporte_bot desde logs de reseteos de ADManager."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+reporte-bot = "reporte_bot.cli:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.12.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.uv.build-backend]
+module-name = "reporte_bot"
