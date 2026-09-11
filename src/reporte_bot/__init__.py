@@ -1,1 +1,1 @@
-"""Pipeline de reporte de reseteos de ADManager."""
+"""Pipeline de reporte de acciones automatizadas del bot."""

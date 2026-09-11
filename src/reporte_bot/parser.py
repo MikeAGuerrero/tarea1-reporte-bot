@@ -7,7 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from reporte_bot.models import LogEntry, ResetEvent, UserInfo
+from reporte_bot.models import LogEntry, ReportEvent, ResetEvent, SapRegisterEvent, UserInfo
 from reporte_bot.utils import normalize_username
 
 ENTRY_RE = re.compile(
@@ -18,7 +18,11 @@ RESET_REQUEST_RE = re.compile(
     r"HTTP Request:\s+(?P<url>http://apitools\.com:8000/v3/users_admin/resetuser\?[^\"]+)\s+"
     r'"HTTP/1\.1"\s+(?P<status>\d{3})'
 )
-SEARCH_FILTER_RE = re.compile(r"\(sAMAccountName:equal:(?P<username>[^)]*)\)")
+SAP_REGISTER_REQUEST_RE = re.compile(
+    r"HTTP Request:\s+(?P<url>http://apitools\.com:8000/v2/sap/register_user\?[^\"]+)\s+"
+    r'"HTTP/1\.1"\s+(?P<status>\d{3})'
+)
+SEARCH_FILTER_RE = re.compile(r"\((?P<field>sAMAccountName|employeeID):equal:(?P<value>[^)]*)\)")
 RAW_RESPONSE_RE = re.compile(r"Raw Response:\s*(?P<body>\{.*\})\s*,\s*Raw status_code:", re.DOTALL)
 ADM_BODY_RE = re.compile(
     r"ADM-Raw response\s*\|\s*status:\s*(?P<status>\d+)\s*\|\s*body:\s*(?P<body>.*)",
@@ -27,6 +31,7 @@ ADM_BODY_RE = re.compile(
 ADM_REASON_RE = re.compile(
     r"ADM-Raw response\s*\|\s*status:\s*(?P<status>\d+)\s*\|\s*reason:\s*(?P<reason>[^|]+)"
 )
+SAP_RAW_RESPONSE_RE = re.compile(r"SAP raw response:\s*(?P<body>\{.*\})", re.DOTALL)
 
 
 def read_log_entries(path: Path) -> list[LogEntry]:
@@ -75,6 +80,19 @@ def _parse_reset_request(entry: LogEntry) -> tuple[str, str, int] | None:
     return requester, target, int(match.group("status"))
 
 
+def _parse_sap_register_request(entry: LogEntry) -> tuple[str, str, str, str, int] | None:
+    match = SAP_REGISTER_REQUEST_RE.search(entry.message)
+    if not match:
+        return None
+
+    query = parse_qs(urlparse(match.group("url")).query)
+    requester = query.get("requester_username", [""])[0]
+    target = query.get("target_employee_id", [""])[0]
+    treatment = query.get("treatment", [""])[0]
+    job = query.get("job", [""])[0]
+    return requester, target, treatment, job, int(match.group("status"))
+
+
 def _user_from_raw(raw_user: dict[str, object]) -> UserInfo:
     def text(field: str) -> str:
         value = raw_user.get(field, "")
@@ -82,6 +100,7 @@ def _user_from_raw(raw_user: dict[str, object]) -> UserInfo:
 
     return UserInfo(
         sam_account_name=text("SAM_ACCOUNT_NAME"),
+        employee_id=text("EMPLOYEE_ID"),
         first_name=text("FIRST_NAME"),
         last_name=text("LAST_NAME"),
         office=text("OFFICE"),
@@ -90,43 +109,76 @@ def _user_from_raw(raw_user: dict[str, object]) -> UserInfo:
     )
 
 
-def _parse_admanager_search(entry: LogEntry) -> tuple[str, UserInfo | None] | None:
-    if "ADManagerRawClient.get_users_list_info_from_admanager invoked" not in entry.message:
+def _parse_admanager_search(entry: LogEntry) -> tuple[str, str, UserInfo | None] | None:
+    if "ADManagerRawClient.get_users_list_info" not in entry.message:
         return None
 
-    user_match = SEARCH_FILTER_RE.search(entry.message)
+    filter_match = SEARCH_FILTER_RE.search(entry.message)
     raw_match = RAW_RESPONSE_RE.search(entry.message)
-    if not user_match or not raw_match:
+    if not filter_match or not raw_match:
         return None
 
-    username = user_match.group("username")
+    field = filter_match.group("field")
+    value = filter_match.group("value")
+
     try:
         payload = json.loads(raw_match.group("body"))
     except json.JSONDecodeError:
-        return username, None
+        return field, value, None
 
     users = payload.get("UsersList") or []
     if not users:
-        return username, None
+        return field, value, None
 
-    return username, _user_from_raw(users[0])
+    return field, value, _user_from_raw(users[0])
 
 
-def _extract_status_message(value: object) -> str | None:
+def _index_admanager_searches(
+    entries: list[LogEntry],
+) -> tuple[dict[str, UserInfo | None], dict[str, UserInfo | None]]:
+    by_sam: dict[str, UserInfo | None] = {}
+    by_employee_id: dict[str, UserInfo | None] = {}
+
+    for entry in entries:
+        parsed = _parse_admanager_search(entry)
+        if parsed is None:
+            continue
+
+        field, value, user_info = parsed
+        key = normalize_username(value)
+        if field == "sAMAccountName":
+            by_sam[key] = user_info
+        elif field == "employeeID":
+            by_employee_id[key] = user_info
+
+    return by_sam, by_employee_id
+
+
+def _extract_nested_text(value: object, key: str) -> str | None:
     if isinstance(value, dict):
-        message = value.get("statusMessage")
-        if message:
-            return str(message).strip()
+        found = value.get(key)
+        if found:
+            return str(found).strip()
         for nested in value.values():
-            result = _extract_status_message(nested)
+            result = _extract_nested_text(nested, key)
             if result:
                 return result
     elif isinstance(value, list):
         for item in value:
-            result = _extract_status_message(item)
+            result = _extract_nested_text(item, key)
             if result:
                 return result
     return None
+
+
+def _parse_python_or_json(body: str) -> object | None:
+    try:
+        return ast.literal_eval(body)
+    except (ValueError, SyntaxError):
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return None
 
 
 def _parse_adm_error(entries: list[LogEntry]) -> str | None:
@@ -137,17 +189,8 @@ def _parse_adm_error(entries: list[LogEntry]) -> str | None:
 
         body_match = ADM_BODY_RE.search(entry.message)
         if body_match:
-            body = body_match.group("body").strip()
-            parsed: object | None = None
-            try:
-                parsed = ast.literal_eval(body)
-            except (ValueError, SyntaxError):
-                try:
-                    parsed = json.loads(body)
-                except json.JSONDecodeError:
-                    parsed = None
-
-            message = _extract_status_message(parsed)
+            parsed = _parse_python_or_json(body_match.group("body").strip())
+            message = _extract_nested_text(parsed, "statusMessage")
             if message:
                 return message
 
@@ -158,46 +201,113 @@ def _parse_adm_error(entries: list[LogEntry]) -> str | None:
     return None
 
 
-def parse_reset_events(path: Path) -> list[ResetEvent]:
-    """Convierte un log completo en eventos del endpoint resetuser únicamente."""
-    operations = group_by_operation(read_log_entries(path))
-    events: list[ResetEvent] = []
+def _parse_sap_message(entries: list[LogEntry]) -> str | None:
+    for entry in reversed(entries):
+        match = SAP_RAW_RESPONSE_RE.search(entry.message)
+        if not match:
+            continue
+        parsed = _parse_python_or_json(match.group("body").strip())
+        message = _extract_nested_text(parsed, "Mensaje")
+        if message:
+            return message
+    return None
 
-    for operation_id, entries in operations.items():
-        request_entry: LogEntry | None = None
-        request_data: tuple[str, str, int] | None = None
 
-        for entry in entries:
-            parsed_request = _parse_reset_request(entry)
-            if parsed_request is not None:
-                request_entry = entry
-                request_data = parsed_request
-                break
+def _sap_was_called(entries: list[LogEntry]) -> bool:
+    return any(
+        "RESTAdapter/segMttoUsuario" in entry.message or "SAP input:" in entry.message
+        for entry in entries
+    )
 
-        if request_entry is None or request_data is None:
+
+def _ticket_was_created(entries: list[LogEntry]) -> bool:
+    return any(
+        "ProactivanetRawClient, method = POST, url = incidents, proactivanet_raw_response:"
+        in entry.message
+        for entry in entries
+    )
+
+
+def _ticket_was_closed(entries: list[LogEntry]) -> bool:
+    return any(
+        "ProactivanetRawClient, method = PUT, url = incidents/" in entry.message
+        and "/close, proactivanet_raw_response:" in entry.message
+        and "'Status': 'Closed'" in entry.message
+        for entry in entries
+    )
+
+
+def _build_reset_event(
+    operation_id: str, entries: list[LogEntry], by_sam: dict[str, UserInfo | None]
+) -> ResetEvent | None:
+    for entry in entries:
+        request_data = _parse_reset_request(entry)
+        if request_data is None:
             continue
 
         requester, target, api_status = request_data
-        searches: dict[str, UserInfo | None] = {}
-
-        for entry in entries:
-            parsed_search = _parse_admanager_search(entry)
-            if parsed_search is None:
-                continue
-            username, user_info = parsed_search
-            searches[normalize_username(username)] = user_info
-
-        events.append(
-            ResetEvent(
-                timestamp=request_entry.timestamp,
-                operation_id=operation_id,
-                requester=requester,
-                target=target,
-                api_status=api_status,
-                requester_info=searches.get(normalize_username(requester)),
-                target_info=searches.get(normalize_username(target)),
-                adm_error=_parse_adm_error(entries),
-            )
+        return ResetEvent(
+            timestamp=entry.timestamp,
+            operation_id=operation_id,
+            requester=requester,
+            target=target,
+            api_status=api_status,
+            requester_info=by_sam.get(normalize_username(requester)),
+            target_info=by_sam.get(normalize_username(target)),
+            adm_error=_parse_adm_error(entries),
         )
+
+    return None
+
+
+def _build_sap_register_event(
+    operation_id: str,
+    entries: list[LogEntry],
+    by_sam: dict[str, UserInfo | None],
+    by_employee_id: dict[str, UserInfo | None],
+) -> SapRegisterEvent | None:
+    for entry in entries:
+        request_data = _parse_sap_register_request(entry)
+        if request_data is None:
+            continue
+
+        requester, target, treatment, job, api_status = request_data
+        return SapRegisterEvent(
+            timestamp=entry.timestamp,
+            operation_id=operation_id,
+            requester=requester,
+            target=target,
+            api_status=api_status,
+            requester_info=by_sam.get(normalize_username(requester)),
+            target_info=by_employee_id.get(normalize_username(target)),
+            treatment=treatment,
+            job=job,
+            sap_message=_parse_sap_message(entries),
+            sap_called=_sap_was_called(entries),
+            ticket_created=_ticket_was_created(entries),
+            ticket_closed=_ticket_was_closed(entries),
+        )
+
+    return None
+
+
+def parse_events(path: Path) -> list[ReportEvent]:
+    """Convierte un log completo en todas las acciones soportadas por el reporte."""
+    operations = group_by_operation(read_log_entries(path))
+    events: list[ReportEvent] = []
+
+    for operation_id, entries in operations.items():
+        by_sam, by_employee_id = _index_admanager_searches(entries)
+
+        reset_event = _build_reset_event(operation_id, entries, by_sam)
+        if reset_event is not None:
+            events.append(reset_event)
+            continue
+
+        sap_register_event = _build_sap_register_event(
+            operation_id, entries, by_sam, by_employee_id
+        )
+        if sap_register_event is not None:
+            events.append(sap_register_event)
 
     return sorted(events, key=lambda event: (event.timestamp, event.operation_id))

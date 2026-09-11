@@ -30,7 +30,9 @@ def _resolve_input(input_file: Path | None, input_dir: Path, date: str | None) -
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Actualiza tabla_reporte_bot.csv a partir de logs de ADManager."
+        description=(
+            "Actualiza tabla_reporte_bot.csv a partir de las acciones soportadas en los logs."
+        )
     )
     parser.add_argument(
         "--date",
@@ -70,7 +72,7 @@ def main() -> None:
         raise SystemExit(f"ERROR: {error}") from error
 
     print(f"Log procesado: {input_path}")
-    print(f"Eventos resetuser encontrados: {processed}")
+    print(f"Eventos soportados encontrados: {processed}")
     print(f"Registros nuevos agregados: {added}")
     print(f"Total de registros en tabla_reporte_bot: {total}")
     print(f"Salida: {args.output}")
