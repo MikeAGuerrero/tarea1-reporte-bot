@@ -1,19 +1,20 @@
-# Tarea 1 - Reporte de reseteos de ADManager
+# Tarea 1 - Reporte de acciones del bot
 
 ## Intención del repositorio
 
 Este proyecto implementa un pipeline de Ingeniería de Datos que actualiza diariamente la tabla
-`tabla_reporte_bot.csv` a partir de archivos `.log`. El proceso toma únicamente las solicitudes
-del endpoint `users_admin/resetuser`, enriquece cada evento con la información de ADManager y
-convierte los resultados técnicos en mensajes legibles para una persona.
+`tabla_reporte_bot.csv` a partir de archivos `.log`.
 
-El diseño busca ser:
+Actualmente procesa dos acciones:
 
-- **Idempotente:** reejecutar un mismo log no duplica ni altera registros existentes.
-- **Recuperable:** se puede procesar cualquier fecha histórica.
-- **Modular:** parsing, reglas de negocio, persistencia y CLI tienen responsabilidades separadas.
-- **Extensible:** la acción y el sistema están desacoplados de la persistencia para permitir agregar
-  más tipos de eventos en el futuro.
+- reseteo de usuarios de ADManager mediante `users_admin/resetuser`;
+- alta de usuarios en SAP mediante `sap/register_user`.
+
+Cada evento se enriquece con la información disponible en ADManager y los resultados técnicos
+se convierten en mensajes legibles para una persona.
+
+El diseño busca ser idempotente, recuperable, modular y extensible para incorporar nuevas
+acciones en el futuro.
 
 ## Estructura
 
@@ -57,24 +58,24 @@ repositorio mediante `.gitignore`.
 Ejemplo:
 
 ```text
-data/input/2026-09-01.log
+data/input/2026-08-31.log
 ```
 
 ## Ejecución
 
-### Procesar automáticamente el log más reciente
+Procesar automáticamente el log más reciente:
 
 ```bash
 uv run reporte-bot
 ```
 
-### Reprocesar una fecha histórica
+Reprocesar una fecha histórica:
 
 ```bash
-uv run reporte-bot --date 2026-09-01
+uv run reporte-bot --date 2026-08-31
 ```
 
-### Procesar un archivo explícito
+Procesar un archivo explícito:
 
 ```bash
 uv run reporte-bot --input /ruta/al/archivo.log
@@ -85,6 +86,13 @@ La salida se genera en:
 ```text
 data/output/tabla_reporte_bot.csv
 ```
+
+## Acciones soportadas
+
+| Acción | Sistema | Endpoint |
+|---|---|---|
+| `reseteo_usuario` | ADManager | `/v3/users_admin/resetuser` |
+| `alta_usuario` | SAP | `/v2/sap/register_user` |
 
 ## Validar estilo
 
@@ -108,4 +116,5 @@ La clave natural utilizada para detectar si un evento ya existe es:
 ```
 
 Al reejecutar el mismo archivo, el proceso conserva los registros existentes y solamente agrega
-eventos nuevos que no estén presentes en el CSV acumulado.
+eventos nuevos que no estén presentes en el CSV acumulado. Como `accion` y `sistema` forman
+parte de la clave, distintas acciones del mismo usuario no colisionan entre sí.
